@@ -1,0 +1,24 @@
+name: Crypto Scanner
+
+on:
+  schedule:
+    # Every 5 minutes (GitHub uses UTC — cron syntax)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:   # Allows manual run from the Actions tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run scanner
+        run: node scanner.js
