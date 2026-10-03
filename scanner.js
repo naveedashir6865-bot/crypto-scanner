@@ -1,41 +1,41 @@
 /**
- * Crypto Futures Scanner — Node.js headless version
- * Scans Binance USDT perpetual futures for:
+ * Crypto Futures Scanner — Node.js headless version (Bybit)
+ * Scans Bybit USDT perpetual futures for:
  *   - Candle close above upper regression line (1H, 40-period, +2σ)
  *   - Green/up slope
  *   - Distance ≥ 3% above upper band
  * Sends push notifications via ntfy.sh
  */
 
-const FUTURES_BASE = 'https://fapi.binance.com';
+const BYBIT_BASE = 'https://api.bybit.com';
 const NTFY_URL = 'https://ntfy.sh/crypto-signals-ashir-x7k2';
 const TOTAL_COINS_TO_SCAN = 500;
-const MIN_DISTANCE_PCT = 3;      // 3% above upper band
-const BATCH_SIZE = 10;
+const MIN_DISTANCE_PCT = 3;
+const BATCH_SIZE = 5;
 const REGRESSION_PERIOD = 40;
 const CANDLE_LIMIT = 100;
 
-// ------------------------------------------------------------------
-// Utility: log with timestamp
-// ------------------------------------------------------------------
 function log(msg) {
     console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
 // ------------------------------------------------------------------
-// Fetch all USDT perpetual futures symbols
+// Fetch all USDT perpetual symbols from Bybit
 // ------------------------------------------------------------------
 async function fetchFuturesSymbols() {
     try {
-        const res = await fetch(`${FUTURES_BASE}/fapi/v1/exchangeInfo`);
+        const res = await fetch(`${BYBIT_BASE}/v5/market/instruments-info?category=linear&limit=1000`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const symbols = data.symbols
-            .filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING' && s.contractType === 'PERPETUAL')
+        if (data.retCode !== 0) throw new Error(`Bybit error: ${data.retMsg}`);
+
+        const symbols = data.result.list
+            .filter(s => s.quoteCoin === 'USDT' && s.status === 'Trading' && s.contractType === 'LinearPerpetual')
             .sort((a, b) => b.symbol.localeCompare(a.symbol))
             .slice(0, TOTAL_COINS_TO_SCAN)
             .map(s => s.symbol);
-        log(`Fetched ${symbols.length} symbols`);
+
+        log(`Fetched ${symbols.length} symbols from Bybit`);
         return symbols;
     } catch (err) {
         log(`ERROR fetching symbols: ${err.message}`);
@@ -44,11 +44,12 @@ async function fetchFuturesSymbols() {
 }
 
 // ------------------------------------------------------------------
-// Fetch candles (1H) for one symbol
+// Fetch candles (1H) for one symbol — Bybit V5 kline endpoint
 // ------------------------------------------------------------------
-async function fetchCandles(symbol, interval = '1h', limit = CANDLE_LIMIT) {
+async function fetchCandles(symbol, interval = '60', limit = CANDLE_LIMIT) {
     try {
-        const res = await fetch(`${FUTURES_BASE}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+        const url = `${BYBIT_BASE}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        const res = await fetch(url);
         if (!res.ok) {
             if (res.status === 429 || res.status === 418) {
                 log(`Rate limited on ${symbol} — sleeping 3s`);
@@ -56,7 +57,10 @@ async function fetchCandles(symbol, interval = '1h', limit = CANDLE_LIMIT) {
             }
             return null;
         }
-        return await res.json();
+        const data = await res.json();
+        if (data.retCode !== 0) return null;
+        // Bybit returns newest first — reverse to oldest first
+        return data.result.list.slice().reverse();
     } catch (err) {
         log(`ERROR fetching candles for ${symbol}: ${err.message}`);
         return null;
@@ -101,16 +105,17 @@ function calcRegression(closes) {
 
 // ------------------------------------------------------------------
 // Analyze one symbol
+// Bybit kline format: [startTime, open, high, low, close, volume, turnover]
 // ------------------------------------------------------------------
 async function analyzeSymbol(symbol) {
-    const candles = await fetchCandles(symbol, '1h', CANDLE_LIMIT);
+    const candles = await fetchCandles(symbol, '60', CANDLE_LIMIT);
     if (!candles || candles.length < REGRESSION_PERIOD) return null;
 
     const closes = candles.map(c => parseFloat(c[4]));
     const currentPrice = closes[closes.length - 1];
     const lastCandle = candles[candles.length - 1];
     const lastClose = parseFloat(lastCandle[4]);
-    const volume = parseFloat(lastCandle[5]);
+    const volume = parseFloat(lastCandle[6] || lastCandle[5]); // turnover or volume
 
     const regression = calcRegression(closes);
     if (!regression) return null;
@@ -131,12 +136,12 @@ async function analyzeSymbol(symbol) {
 }
 
 // ------------------------------------------------------------------
-// Check if a signal matches the strict criteria
+// Strict criteria
 // ------------------------------------------------------------------
 function qualifiesForAlert(signal) {
     if (!signal) return false;
     if (signal.signal !== 'SELL') return false;
-    if (signal.slope <= 0) return false;                    // green/up slope only
+    if (signal.slope <= 0) return false;
     if (Math.abs(signal.distancePercent) < MIN_DISTANCE_PCT) return false;
     return true;
 }
@@ -146,7 +151,7 @@ function qualifiesForAlert(signal) {
 // ------------------------------------------------------------------
 async function sendPush(signal) {
     const symbol = signal.symbol;
-    const tvUrl = `https://www.tradingview.com/chart/?symbol=BINANCE%3A${symbol.replace(/USDT$/i, '')}USDT.P`;
+    const tvUrl = `https://www.tradingview.com/chart/?symbol=BYBIT%3A${symbol}.P`;
 
     const title = `${symbol} SELL Signal`;
     const body =
@@ -162,7 +167,7 @@ async function sendPush(signal) {
         const res = await fetch(NTFY_URL, {
             method: 'POST',
             headers: {
-                'Title': title,          // ASCII only
+                'Title': title,
                 'Priority': 'high',
                 'Tags': 'warning',
                 'Click': tvUrl
@@ -216,8 +221,8 @@ async function main() {
             }
         }
 
-        // Small delay between batches to be polite to Binance
-        await new Promise(r => setTimeout(r, 100));
+        // Polite delay between batches
+        await new Promise(r => setTimeout(r, 150));
     }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
